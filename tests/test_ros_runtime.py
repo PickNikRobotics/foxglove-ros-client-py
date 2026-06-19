@@ -12,6 +12,7 @@ class FakeProtocol:
         self.call_id = 1
         self.subscribed = []
         self.calls = []
+        self.subscribed_connection_graph = False
 
     def on(self, *_args):
         pass
@@ -41,6 +42,9 @@ class FakeProtocol:
     def set_parameters(self, parameters, request_id):
         self.set_parameter_request = (parameters, request_id)
 
+    def subscribe_connection_graph(self):
+        self.subscribed_connection_graph = True
+
     def call_service(self, service_id, encoding, request_data):
         self.calls.append((service_id, encoding, request_data))
         result = self.call_id
@@ -58,6 +62,8 @@ def make_ros():
     ros.channels_by_topic = {}
     ros.services = {}
     ros.services_by_name = {}
+    ros.capabilities = set()
+    ros.supported_encodings = []
     ros._subscriptions = {}
     ros._subscriptions_by_topic = {}
     ros._pending_subscribers = []
@@ -66,10 +72,14 @@ def make_ros():
     ros._pending_params = {}
     ros._known_params = {}
     ros._next_param_request_id = 1
+    ros._topic_publishers = {}
+    ros._topic_subscribers = {}
+    ros._service_providers = {}
     ros._lock = threading.RLock()
     ros._advertisements_ready = threading.Event()
     ros._channels_ready = threading.Event()
     ros._services_ready = threading.Event()
+    ros._connection_graph_ready = threading.Event()
     return ros
 
 
@@ -187,13 +197,66 @@ def test_schema_details_match_rosapi_typedef_shape():
 def test_param_names_are_tracked_from_set_and_parameter_values():
     ros = make_ros()
     ros.set_param_async("/node:param", 42)
-    assert ros.get_params() == ["node.param"]
+    assert sorted(ros._known_params) == ["node.param"]
 
     received = []
     ros.get_param_async("/node:param", received.append)
     ros._on_parameter_values("param_get_2", [{"name": "node.param", "value": 43}])
     assert received == [43]
-    assert ros.get_params() == ["node.param"]
+    assert sorted(ros._known_params) == ["node.param"]
+
+
+def test_get_params_requests_full_parameter_list():
+    ros = make_ros()
+    received = []
+
+    ros.get_params(received.append)
+    assert ros.protocol.get_parameter_request == ([], "param_list_1")
+
+    ros._on_parameter_values(
+        "param_list_1",
+        [{"name": "/node:param", "value": 43}, {"name": "plain_param", "value": True}],
+    )
+    assert received == [["node.param", "plain_param"]]
+
+
+def test_delete_param_uses_unset_set_parameters_request():
+    ros = make_ros()
+    ros._known_params["node.param"] = 42
+    received = []
+
+    ros.delete_param_async("/node:param", received.append)
+    assert ros.protocol.set_parameter_request == ([{"name": "node.param"}], "param_delete_1")
+
+    ros._on_parameter_values("param_delete_1", [])
+    assert received == [None]
+    assert "node.param" not in ros._known_params
+
+
+def test_connection_graph_populates_node_details():
+    ros = make_ros()
+
+    ros._on_server_info({"capabilities": ["connectionGraph"], "supportedEncodings": ["cdr"]})
+    assert ros.protocol.subscribed_connection_graph
+    assert ros.capabilities == {"connectionGraph"}
+
+    ros._on_connection_graph_update(
+        {
+            "publishedTopics": [{"name": "/scan", "publisherIds": ["/lidar"]}],
+            "subscribedTopics": [{"name": "/cmd_vel", "subscriberIds": ["/base"]}],
+            "advertisedServices": [{"name": "/reset", "providerIds": ["/base"]}],
+            "removedTopics": [],
+            "removedServices": [],
+        }
+    )
+
+    assert ros.get_nodes() == ["/base", "/lidar"]
+    assert ros.get_node_details("/base") == {
+        "services": ["/reset"],
+        "subscribing": ["/cmd_vel"],
+        "publishing": [],
+    }
+    assert ros.wait_for_connection_graph(0)
 
 
 def test_action_server_discovery_uses_hidden_send_goal_services():

@@ -310,7 +310,10 @@ class Param:
         errback: Callable[[Any], None] | None = None,
         timeout: float | None = None,
     ) -> Any:
-        raise NotImplementedError("foxglove_bridge parameter operations do not expose deleteParameters.")
+        if callback:
+            self.ros.delete_param_async(self.name, callback, errback)
+            return None
+        return self.ros.delete_param_sync(self.name, timeout)
 
 
 __all__ = [

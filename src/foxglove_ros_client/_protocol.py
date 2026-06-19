@@ -51,6 +51,7 @@ class FoxgloveProtocolClient:
             "open": [],
             "close": [],
             "error": [],
+            "serverInfo": [],
             "advertise": [],
             "unadvertise": [],
             "advertiseServices": [],
@@ -59,6 +60,7 @@ class FoxgloveProtocolClient:
             "serviceResponse": [],
             "serviceCallFailure": [],
             "parameterValues": [],
+            "connectionGraphUpdate": [],
         }
 
     @property
@@ -136,6 +138,12 @@ class FoxgloveProtocolClient:
     def set_parameters(self, parameters: list[dict[str, Any]], request_id: str) -> None:
         self.send_json({"op": "setParameters", "parameters": parameters, "id": request_id})
 
+    def subscribe_connection_graph(self) -> None:
+        self.send_json({"op": "subscribeConnectionGraph"})
+
+    def unsubscribe_connection_graph(self) -> None:
+        self.send_json({"op": "unsubscribeConnectionGraph"})
+
     def send_json(self, message: dict[str, Any]) -> None:
         self._send(json.dumps({k: v for k, v in message.items() if v is not None}))
 
@@ -183,7 +191,9 @@ class FoxgloveProtocolClient:
             return
 
         op = message.get("op")
-        if op == "advertise":
+        if op == "serverInfo":
+            self._emit("serverInfo", message)
+        elif op == "advertise":
             self._emit("advertise", [_read_channel(ch) for ch in message.get("channels", [])])
         elif op == "unadvertise":
             self._emit("unadvertise", list(message.get("channelIds", [])))
@@ -195,6 +205,8 @@ class FoxgloveProtocolClient:
             self._emit("parameterValues", message.get("id", ""), message.get("parameters", []))
         elif op == "serviceCallFailure":
             self._emit("serviceCallFailure", message)
+        elif op == "connectionGraphUpdate":
+            self._emit("connectionGraphUpdate", message)
 
     def _handle_binary(self, payload: bytes) -> None:
         if not payload:

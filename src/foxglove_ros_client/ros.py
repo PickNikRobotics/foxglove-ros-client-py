@@ -34,6 +34,8 @@ class Ros(EventEmitterMixin):
         self.channels_by_topic: dict[str, FoxgloveChannel] = {}
         self.services: dict[int, FoxgloveService] = {}
         self.services_by_name: dict[str, FoxgloveService] = {}
+        self.capabilities: set[str] = set()
+        self.supported_encodings: list[str] = []
 
         self._subscriptions: dict[int, dict[str, Any]] = {}
         self._subscriptions_by_topic: dict[str, int] = {}
@@ -43,10 +45,14 @@ class Ros(EventEmitterMixin):
         self._pending_params: dict[str, dict[str, Any]] = {}
         self._known_params: dict[str, Any] = {}
         self._next_param_request_id = 1
+        self._topic_publishers: dict[str, set[str]] = {}
+        self._topic_subscribers: dict[str, set[str]] = {}
+        self._service_providers: dict[str, set[str]] = {}
         self._lock = threading.RLock()
         self._advertisements_ready = threading.Event()
         self._channels_ready = threading.Event()
         self._services_ready = threading.Event()
+        self._connection_graph_ready = threading.Event()
 
         self._wire_protocol()
         self.connect()
@@ -78,6 +84,9 @@ class Ros(EventEmitterMixin):
 
     def wait_for_advertisements(self, timeout: float | None = CONNECTION_TIMEOUT) -> bool:
         return self._advertisements_ready.wait(timeout)
+
+    def wait_for_connection_graph(self, timeout: float | None = CONNECTION_TIMEOUT) -> bool:
+        return self._connection_graph_ready.wait(timeout)
 
     def run_forever(self) -> None:
         if self.protocol.thread and self.protocol.thread.is_alive():
@@ -306,8 +315,33 @@ class Ros(EventEmitterMixin):
         callback: Callable[[list[str]], None] | None = None,
         errback: Callable[[Any], None] | None = None,
     ) -> Any:
-        params = sorted(self._known_params.keys())
-        return _callback_or_return(params, callback)
+        if callback:
+            self.get_params_async(callback, errback)
+            return None
+        return self.get_params_sync(ROSAPI_TIMEOUT)
+
+    def get_params_async(
+        self,
+        callback: Callable[[list[str]], None],
+        errback: Callable[[Any], None] | None = None,
+    ) -> None:
+        request_id = "param_list_%d" % self._next_param_request_id
+        self._next_param_request_id += 1
+        self._pending_params[request_id] = {"callback": callback, "errback": errback, "list": True}
+        self.protocol.get_parameters([], request_id)
+
+    def get_params_sync(self, timeout: float | None = None) -> list[str]:
+        event = threading.Event()
+        result: dict[str, Any] = {}
+        self.get_params_async(
+            lambda value: (result.setdefault("value", value), event.set()),
+            lambda error: (result.setdefault("error", error), event.set()),
+        )
+        if not event.wait(timeout if timeout is not None else ROSAPI_TIMEOUT):
+            raise RosTimeoutError("Timed out waiting for parameter list")
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result.get("value", [])
 
     def get_param(
         self,
@@ -332,11 +366,33 @@ class Ros(EventEmitterMixin):
         callback: Callable[[Any], None] | None = None,
         errback: Callable[[Any], None] | None = None,
     ) -> Any:
-        error = NotImplementedError("foxglove_bridge parameter operations do not expose deleteParameters.")
-        if errback:
-            errback(error)
-            return None
-        raise error
+        return self.delete_param_async(name, callback, errback) if callback else self.delete_param_sync(name, ROSAPI_TIMEOUT)
+
+    def delete_param_async(
+        self,
+        name: str,
+        callback: Callable[[Any], None] | None = None,
+        errback: Callable[[Any], None] | None = None,
+    ) -> None:
+        request_id = "param_delete_%d" % self._next_param_request_id
+        self._next_param_request_id += 1
+        wire_name = _to_foxglove_param_name(name)
+        self._pending_params[request_id] = {"callback": callback, "errback": errback, "name": wire_name, "delete": True}
+        self.protocol.set_parameters([{"name": wire_name}], request_id)
+
+    def delete_param_sync(self, name: str, timeout: float | None = None) -> Any:
+        event = threading.Event()
+        result: dict[str, Any] = {}
+        self.delete_param_async(
+            name,
+            lambda _value=None: (result.setdefault("value", _value), event.set()),
+            lambda error: (result.setdefault("error", error), event.set()),
+        )
+        if not event.wait(timeout if timeout is not None else ROSAPI_TIMEOUT):
+            raise RosTimeoutError("Timed out waiting for parameter delete response")
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result.get("value")
 
     def get_action_servers(
         self,
@@ -355,7 +411,14 @@ class Ros(EventEmitterMixin):
         callback: Callable[[list[str]], None] | None = None,
         errback: Callable[[Any], None] | None = None,
     ) -> Any:
-        return _callback_or_return([], callback)
+        nodes = sorted(
+            {
+                *[node for nodes in self._topic_publishers.values() for node in nodes],
+                *[node for nodes in self._topic_subscribers.values() for node in nodes],
+                *[node for nodes in self._service_providers.values() for node in nodes],
+            }
+        )
+        return _callback_or_return(nodes, callback)
 
     def get_node_details(
         self,
@@ -363,7 +426,12 @@ class Ros(EventEmitterMixin):
         callback: Callable[[dict[str, list[str]]], None] | None = None,
         errback: Callable[[Any], None] | None = None,
     ) -> Any:
-        return _callback_or_return({"services": [], "subscribing": [], "publishing": []}, callback)
+        details = {
+            "services": sorted(name for name, providers in self._service_providers.items() if node in providers),
+            "subscribing": sorted(name for name, subscribers in self._topic_subscribers.items() if node in subscribers),
+            "publishing": sorted(name for name, publishers in self._topic_publishers.items() if node in publishers),
+        }
+        return _callback_or_return(details, callback)
 
     def authenticate(self, mac: str, client: str, dest: str, rand: str, t: float, level: str, end: float) -> None:
         # Foxglove WebSocket authentication is handled during the WebSocket
@@ -545,6 +613,7 @@ class Ros(EventEmitterMixin):
         self.protocol.on("open", lambda: self.emit("connection"))
         self.protocol.on("close", self._on_close)
         self.protocol.on("error", lambda error: self.emit("error", error))
+        self.protocol.on("serverInfo", self._on_server_info)
         self.protocol.on("advertise", self._on_advertise)
         self.protocol.on("unadvertise", self._on_unadvertise)
         self.protocol.on("advertiseServices", self._on_advertise_services)
@@ -553,6 +622,7 @@ class Ros(EventEmitterMixin):
         self.protocol.on("serviceResponse", self._on_service_response)
         self.protocol.on("serviceCallFailure", self._on_service_failure)
         self.protocol.on("parameterValues", self._on_parameter_values)
+        self.protocol.on("connectionGraphUpdate", self._on_connection_graph_update)
 
     def _create_subscription(
         self,
@@ -617,14 +687,26 @@ class Ros(EventEmitterMixin):
                 return service
         return None
 
+    def _on_server_info(self, info: dict[str, Any]) -> None:
+        self.capabilities = set(info.get("capabilities", []))
+        self.supported_encodings = list(info.get("supportedEncodings", []))
+        if "connectionGraph" in self.capabilities:
+            self.protocol.subscribe_connection_graph()
+
     def _on_close(self) -> None:
         self.channels.clear()
         self.channels_by_topic.clear()
         self.services.clear()
         self.services_by_name.clear()
+        self.capabilities.clear()
+        self.supported_encodings.clear()
+        self._topic_publishers.clear()
+        self._topic_subscribers.clear()
+        self._service_providers.clear()
         self._advertisements_ready.clear()
         self._channels_ready.clear()
         self._services_ready.clear()
+        self._connection_graph_ready.clear()
         self._subscriptions.clear()
         self._subscriptions_by_topic.clear()
         self._client_channels.clear()
@@ -679,6 +761,25 @@ class Ros(EventEmitterMixin):
                 if service:
                     self.services_by_name.pop(service.name, None)
 
+    def _on_connection_graph_update(self, update: dict[str, Any]) -> None:
+        with self._lock:
+            for topic_name in update.get("removedTopics", []):
+                self._topic_publishers.pop(topic_name, None)
+                self._topic_subscribers.pop(topic_name, None)
+            for service_name in update.get("removedServices", []):
+                self._service_providers.pop(service_name, None)
+            for topic in update.get("publishedTopics", []):
+                self._topic_publishers[topic.get("name", "")] = set(topic.get("publisherIds", []))
+            for topic in update.get("subscribedTopics", []):
+                self._topic_subscribers[topic.get("name", "")] = set(topic.get("subscriberIds", []))
+            for service in update.get("advertisedServices", []):
+                self._service_providers[service.get("name", "")] = set(service.get("providerIds", []))
+            self._topic_publishers.pop("", None)
+            self._topic_subscribers.pop("", None)
+            self._service_providers.pop("", None)
+            self._connection_graph_ready.set()
+        self.emit("connectionGraphChanged")
+
     def _on_message(self, subscription_id: int, _timestamp: int, data: bytes) -> None:
         subscription = self._subscriptions.get(subscription_id)
         if not subscription:
@@ -724,6 +825,17 @@ class Ros(EventEmitterMixin):
             return
         callback = pending.get("callback")
         if not callback:
+            return
+        if pending.get("list"):
+            for param in parameters:
+                name = _to_foxglove_param_name(param.get("name", ""))
+                if name:
+                    self._known_params[name] = param.get("value")
+            callback(sorted(self._known_params.keys()))
+            return
+        if pending.get("delete"):
+            self._known_params.pop(pending["name"], None)
+            callback(None)
             return
         if pending.get("set"):
             callback(None)

@@ -29,9 +29,13 @@ Supported:
   `get_topics()`, `get_topic_type()`, `get_topics_for_type()`,
   `get_services()`, `get_service_type()`, `get_services_for_type()`,
   `get_message_details()`, `get_service_request_details()`,
-  `get_service_response_details()`, and action-server discovery.
+  `get_service_response_details()`, `get_nodes()`, `get_node_details()`, and
+  action-server discovery.
 - ROS 2 `ActionClient.send_goal()`, `cancel_goal()`, and `wait_goal()` when the
   bridge advertises hidden action endpoints.
+- Full parameter listing via `get_params()` and best-effort parameter deletion
+  via `delete_param()` / `Param.delete()` when the server accepts parameter
+  updates.
 - ROS 1-style `foxglove_ros_client.ros1.actionlib.ActionClient`, `Goal`, and
   `SimpleActionServer` over action topics.
 - `TFClient` over `/tf` and `/tf_static`, including fixed-frame resolution
@@ -45,12 +49,16 @@ Not supported:
 
 - Client-side service advertisement. `foxglove_bridge` does not expose a
   WebSocket protocol for Python clients to serve ROS services.
-- Full ROS graph node introspection. `get_nodes()` and `get_node_details()`
-  currently return empty local best-effort data because Foxglove advertisements
-  do not include node ownership.
-- Parameter deletion and global parameter listing. `get_params()` reports
-  parameters seen through this client session; the Foxglove protocol does not
-  expose a `deleteParameters` or `listParameters` operation.
+
+Notes:
+
+- `get_nodes()` and `get_node_details()` use Foxglove connection graph updates.
+  They return data only when the server advertises the `connectionGraph`
+  capability.
+- `get_params()` requests all currently set parameters with `getParameters`.
+  Parameter deletion is represented as a `setParameters` request with an unset
+  value; a ROS bridge or node can still reject the change for normal middleware
+  reasons such as read-only or undeclared parameters.
 
 ## Install From Source
 
