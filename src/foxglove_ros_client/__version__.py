@@ -1,0 +1,8 @@
+__title__ = "foxglove-ros-client-py"
+__description__ = "Python client for foxglove_bridge with a roslibpy-compatible API"
+__url__ = "https://github.com/noah-wardlow/foxglove-ros-client-py"
+__version__ = "0.1.0"
+__author__ = "Noah Wardlow"
+__author_email__ = ""
+__license__ = "MIT"
+__copyright__ = "Copyright (c) 2026 Noah Wardlow"
