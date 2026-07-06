@@ -63,7 +63,7 @@ Notes:
 ## Install From Source
 
 ```bash
-git clone https://github.com/noah-wardlow/foxglove-ros-client-py.git
+git clone https://github.com/PickNikRobotics/foxglove-ros-client-py.git
 python -m pip install ./foxglove-ros-client-py
 ```
 
